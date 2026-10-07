@@ -4,7 +4,8 @@ Accessibility-first UX research and conversion analytics for Flutter apps. Track
 find friction (rage taps, u-turns, form errors), run in-app surveys and collect feedback, and segment
 every funnel and journey by assistive-technology use (screen reader, large text, reduced motion, …).
 
-Works on iOS, Android, web and desktop. Pure Dart: no platform channels.
+Works on iOS, Android, web and desktop. Uses `package_info_plus` (app version) and `url_launcher`
+(study invite links) and no platform code of its own.
 
 ## Install
 
@@ -22,10 +23,7 @@ import 'package:flutter/material.dart';
 import 'package:metrickle/metrickle.dart';
 
 Future<void> main() async {
-  await Metrickle.init(
-    writeKey: 'mk_live_…',
-    options: const MetrickleOptions(appVersion: '1.4.0', appBuild: '112'),
-  );
+  await Metrickle.init(writeKey: 'mk_live_…');
   runApp(MaterialApp(
     navigatorObservers: [MetrickleNavigatorObserver()],
     builder: (context, child) => MetrickleScope(child: child!),
@@ -78,6 +76,17 @@ Sent automatically: `$app_open` (launch and each return to the foreground), `$ap
 `$screen`, `$u_turn` (A → B → back to A within 7s) and `$rage_click` (3 taps within 1s inside 30
 logical px, identified by `Semantics(identifier:)`, a `ValueKey<String>` or the widget class).
 
+## Revenue from Stripe or RevenueCat
+
+Connect your RevenueCat project (or Stripe account) in the Metrickle dashboard under Integrations → Revenue. Purchases, renewals, refunds and cancels then arrive server-side on the person you identified, so a refund takes back the task they completed. Log in to RevenueCat with the same id:
+
+```dart
+mk.identify(user.id);
+await Purchases.logIn(user.id);
+// Or keep RevenueCat's id and name the Metrickle user:
+// await Purchases.setAttributes({'metrickle_user_id': user.id});
+```
+
 ## Options
 
 | Option | Default | |
@@ -89,9 +98,10 @@ logical px, identified by `Semantics(identifier:)`, a `ValueKey<String>` or the 
 | `rageTaps` | `true` | Needs `MetrickleScope` |
 | `debug` | `false` | Logs queued events and send results |
 | `beforeSend` | | `(event) => event` to scrub, `null` to drop |
-| `appVersion`, `appBuild` | | e.g. from `package_info_plus` |
+| `appVersion`, `appBuild` | read from the package info | Set them to override; the version is how releases are detected |
 | `deviceModel`, `osVersion`, `timezone` | read where possible | Flutter can't read the device model without a plugin |
 | `httpClient`, `storage` | `http.Client()`, SharedPreferences | Inject for tests |
+| `openUrl` | system browser (`url_launcher`) | How study invite links open; inject for tests |
 
 Events are queued in SharedPreferences (up to 1000, dropped after 7 days) so they survive the app
 being killed and offline periods. Failed sends back off from 1s to 60s.
@@ -116,6 +126,33 @@ final stop = Metrickle.instance.surveys.onShow((survey) {
 Metrickle.instance.surveys.show('cmp_123'); // QA: show now, ignoring targeting
 ```
 
+### Follow-ups (study invites)
+
+A campaign can invite people who answered into a study: a booked video call (moderated) or a
+self-guided test on the web (unmoderated), optionally only for some answers (e.g. NPS 0–6). After the
+last answer the built-in sheet asks for the respondent's personal link ("One moment…" on the submit
+button, up to 5 seconds). If one comes back it shows the invite, with its heading focused and
+announced, "No thanks" and "Choose a time" / "Take part", which opens the link in the system browser.
+Otherwise it shows the usual thank-you. The invite never closes on its own.
+
+With your own renderer:
+
+```dart
+survey.complete();
+if (survey.followUp != null && survey.qualifies()) {
+  final url = await survey.invite(); // null: show the plain thank-you
+  if (url != null) {
+    survey.followUpOffered(); // once the invite is on screen
+    // Show survey.followUp!.prompt with your buttons. When they accept:
+    survey.followUpAccepted();
+    await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+  }
+}
+```
+
+`invite()` asks once per response and only returns https links. `$survey_follow_up` is recorded at
+most once for the offer and once for the acceptance.
+
 Turn the built-in sheet off with `MetrickleScope(builtInSurveys: false, child: …)`. The sheet opens on
 the navigator of a `MetrickleNavigatorObserver` (or a `Navigator` above the scope).
 
@@ -130,7 +167,14 @@ final result = await Metrickle.instance.feedback.submit(
 );
 ```
 
-Feedback can be switched off per platform under Settings → Research in the dashboard. While it's off, `Metrickle.instance.feedback.isEnabled` is false and `submit` sends nothing, so use it to hide your feedback button.
+Feedback can be switched off per platform under Settings → Research in the dashboard. While it's off, `Metrickle.instance.feedback.isEnabled` is false and `submit` sends nothing, so use it to hide your feedback button. Settings arrive after launch, so rebuild when they do:
+
+```dart
+ValueListenableBuilder(
+  valueListenable: Metrickle.instance.configListenable,
+  builder: (context, _, _) => Metrickle.instance.feedback.isEnabled ? const FeedbackButton() : const SizedBox.shrink(),
+);
+```
 
 Session, screen, device, app version, locale and accessibility settings are attached. Screenshots are
 PNG, downscaled to 1280px on the long edge and at most 2 MB.
@@ -139,7 +183,10 @@ PNG, downscaled to 1280px on the long edge and at most 2 MB.
 
 - Text field contents are never captured, only identifiers and semantics labels.
 - No advertising ids or device serials. The anonymous id is a random UUID in app storage.
-- `optOut()` clears the queue and stops all network calls, and is remembered; `optIn()` reverses it.
+- `optOut()` stops all collection and network calls, clears the queue and removes the anonymous and
+  session ids from the device, and is remembered. While opted out no anonymous id is created, on
+  launch or by `reset()`. Your own user id (from `identify`) and consent are kept. `optIn()` starts a
+  new anonymous id and fetches surveys and settings again.
 - `cookieless: true` stores nothing on the device.
 - `consent(replay: true)` records consent for research features (kept for parity with the web SDK).
 

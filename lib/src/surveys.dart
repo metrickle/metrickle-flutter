@@ -5,6 +5,7 @@ import 'dart:math' as math;
 import 'client.dart';
 import 'config.dart';
 import 'event.dart';
+import 'platform/device.dart';
 
 /// Headless survey engine, a port of `surveys.ts`. It decides *whether and when* to show a campaign
 /// (trigger, targeting, sampling, frequency caps) and turns answers into `$survey_*` events.
@@ -33,6 +34,50 @@ abstract interface class ActiveSurvey {
 
   /// The user closed it; [atIndex] is the question they were on.
   void dismiss(int atIndex);
+
+  /// The campaign's follow-up: an invite into a study (a booked video call or a self-guided test),
+  /// offered after the last answer. Only present while the study is recruiting.
+  FollowUpConfig? get followUp;
+
+  /// Whether this response qualifies for the follow-up (false when there is none). Call after the
+  /// last answer.
+  bool qualifies();
+
+  /// Asks for the respondent's personal study link. Completes with null when there's no follow-up,
+  /// the response doesn't qualify, the study stopped recruiting or is full, or the request failed:
+  /// then show the plain thank-you. Asked at most once per response.
+  Future<String?> invite();
+
+  /// Call when the invite is on screen.
+  void followUpOffered();
+
+  /// Call when the respondent opens the link.
+  void followUpAccepted();
+}
+
+/// An answer as the follow-up condition sees it.
+typedef FollowUpAnswer = ({num? score, List<String>? values});
+
+/// Whether [answers] (by question id) meet a follow-up's [when] condition. No condition matches
+/// everything. Port of `followUpMatches` in `packages/schema/src/constants.ts`.
+bool followUpMatches(FollowUpWhen? when, Map<String, FollowUpAnswer> answers) {
+  if (when == null) return true;
+  final a = answers[when.questionId];
+  if (a == null) return false;
+  final choices = when.choices;
+  if (choices != null && choices.isNotEmpty) return a.values?.any(choices.contains) ?? false;
+  final score = a.score;
+  if (score == null) return false;
+  return (when.min == null || score >= when.min!) && (when.max == null || score <= when.max!);
+}
+
+/// A personal link is only ever opened if it's https (http only when the ingest host is http,
+/// i.e. local development): never `javascript:` or similar.
+String? safeInviteUrl(Object? url, String host) {
+  if (url is! String) return null;
+  final u = Uri.tryParse(url);
+  if (u == null || u.host.isEmpty) return null;
+  return u.scheme == 'https' || (u.scheme == 'http' && host.startsWith('http:')) ? u.toString() : null;
 }
 
 class CampaignState {
@@ -130,14 +175,14 @@ bool eligible(CampaignConfig c, EligibilityContext ctx, SurveyState state) {
 
 /// The engine. Created by [Metrickle]; apps use `Metrickle.surveys`.
 class SurveyEngine {
-  SurveyEngine(this._client, {required this.platform, this.appVersion, required this.a11y}) {
+  SurveyEngine(this._client, {required this.platform, required this.appVersion, required this.a11y}) {
     _loaded = _load();
     _client.onEvent(_handle);
   }
 
   final Metrickle _client;
   final String platform;
-  final String? appVersion;
+  final String? Function() appVersion;
   final List<String> Function() a11y;
 
   List<CampaignConfig> _campaigns = [];
@@ -233,7 +278,7 @@ class SurveyEngine {
         anonymousId: id.anonymousId,
         userId: id.userId,
         platform: platform,
-        appVersion: appVersion,
+        appVersion: appVersion(),
         a11y: a11y(),
         now: _client.now(),
       ),
@@ -274,7 +319,16 @@ class _Survey implements ActiveSurvey {
   final String? _path;
   int _answered = 0;
 
+  /// This response's answers by question, for the follow-up condition.
+  final Map<String, FollowUpAnswer> _answers = {};
+  Future<String?>? _link;
+  bool _offered = false;
+  bool _accepted = false;
+
   Metrickle get _client => _engine._client;
+
+  @override
+  FollowUpConfig? get followUp => campaign.followUp;
 
   @override
   void shown() {
@@ -287,6 +341,7 @@ class _Survey implements ActiveSurvey {
   @override
   void answer(Question q, SurveyAnswer a) {
     _answered++;
+    _answers[q.id] = (score: a.score, values: a.values != null && a.values!.isNotEmpty ? a.values : null);
     final last = campaign.questions.isNotEmpty && q.id == campaign.questions.last.id;
     final values = a.values;
     final text = a.text?.trim();
@@ -311,5 +366,66 @@ class _Survey implements ActiveSurvey {
     _engine._active = null;
     _engine._record(campaign.id, (s) => s.dismissed = _client.now());
     _client.capture('track', r'$survey_dismissed', path: _path, properties: {..._base, 'at': atIndex, 'answered': _answered});
+  }
+
+  @override
+  bool qualifies() {
+    final f = followUp;
+    return f != null && followUpMatches(f.when, _answers);
+  }
+
+  @override
+  Future<String?> invite() {
+    final f = followUp;
+    if (f == null || _client.isOptedOut || !qualifies()) return Future.value(null);
+    return _link ??= _requestInvite(f);
+  }
+
+  /// `POST /v1/studies/invite`: the respondent's personal study link, or null for anything but a 201.
+  Future<String?> _requestInvite(FollowUpConfig f) async {
+    final c = _client;
+    final id = c.identity();
+    try {
+      final res = await c.httpClient
+          .post(
+            Uri.parse('${c.host}/v1/studies/invite'),
+            headers: {
+              'content-type': 'application/json',
+              'x-metrickle-key': c.writeKey,
+              if (canSetUserAgent) 'user-agent': c.userAgent,
+            },
+            body: jsonEncode({
+              'writeKey': c.writeKey,
+              'studyId': f.studyId,
+              'campaignId': campaign.id,
+              'response': _base['response'],
+              'anonymousId': ?id.anonymousId,
+              'userId': ?id.userId,
+            }),
+          )
+          .timeout(const Duration(seconds: 30));
+      if (res.statusCode != 201) return null;
+      final data = jsonDecode(res.body);
+      return data is Map ? safeInviteUrl(data['url'], c.host) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  void _followUpEvent(bool accepted) => _client.capture('track', r'$survey_follow_up',
+      path: _path, properties: {..._base, 'study': followUp!.studyId, 'accepted': accepted});
+
+  @override
+  void followUpOffered() {
+    if (followUp == null || _offered) return;
+    _offered = true;
+    _followUpEvent(false);
+  }
+
+  @override
+  void followUpAccepted() {
+    if (followUp == null || _accepted) return;
+    _accepted = true;
+    _followUpEvent(true);
   }
 }

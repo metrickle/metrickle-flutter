@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:metrickle/metrickle.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
 import 'helpers.dart';
 
@@ -24,7 +25,7 @@ void main() {
     expect(req.headers['content-type'], startsWith('application/json'));
     expect(req.headers['x-metrickle-key'], 'wk_test');
     // Browsers forbid setting User-Agent.
-    expect(req.headers['user-agent'], kIsWeb ? isNull : matches(RegExp(r'^metrickle-flutter/0\.1\.0 \(\w+ 15; Pixel 9\)$')));
+    expect(req.headers['user-agent'], kIsWeb ? isNull : matches(RegExp(r'^metrickle-flutter/0\.2\.0 \(\w+ 15; Pixel 9\)$')));
     expect(client.userAgent, isNot(matches(RegExp('bot|crawl|spider|headless|monitor|preview|curl', caseSensitive: false))));
 
     final body = jsonDecode(req.body) as Map<String, dynamic>;
@@ -209,6 +210,79 @@ void main() {
     expect(again.isOptedOut, isTrue);
     again.optIn();
     expect(h.storage.data.containsKey('mk_optout'), isFalse);
+  });
+
+  test('opt-out: a first launch while opted out creates no anonymous id', () async {
+    final h = Harness();
+    h.storage.data['mk_optout'] = '1';
+    final client = await h.start();
+    expect(client.identity().anonymousId, isNull);
+    expect(h.storage.data.containsKey('mk_aid'), isFalse);
+  });
+
+  test('opt-out: an id stored from before is not used', () async {
+    final h = Harness();
+    h.storage.data['mk_optout'] = '1';
+    h.storage.data['mk_aid'] = 'old-anon';
+    final client = await h.start();
+    expect(client.identity().anonymousId, isNull);
+  });
+
+  test('opt-out removes the stored anonymous and session ids, keeps the user id and consent', () async {
+    final h = Harness();
+    final client = await h.start();
+    client.identify('user_42');
+    client.consent(replay: true);
+    client.track('a');
+    await Future<void>.delayed(Duration.zero);
+    expect(h.storage.data.keys, containsAll(['mk_aid', 'mk_sid', 'mk_queue']));
+    client.optOut();
+    await Future<void>.delayed(Duration.zero);
+    expect(client.identity().anonymousId, isNull);
+    expect(client.identity().sessionId, isNull);
+    expect(h.storage.data.keys, isNot(anyOf(contains('mk_aid'), contains('mk_sid'), contains('mk_queue'))));
+    expect(h.storage.data['mk_uid'], 'user_42');
+    expect(h.storage.data['mk_consent'], 'replay');
+    expect(h.storage.data['mk_optout'], '1');
+  });
+
+  test('reset while opted out creates no anonymous id; opt-in creates one and refetches the config', () async {
+    final h = Harness(config: {'v': 1, 'campaigns': []});
+    final client = await h.start();
+    client.optOut();
+    client.reset();
+    await Future<void>.delayed(Duration.zero);
+    expect(client.identity().anonymousId, isNull);
+    expect(h.storage.data.containsKey('mk_aid'), isFalse);
+
+    h.requests.clear();
+    client.optIn();
+    await Future<void>.delayed(Duration.zero);
+    final aid = client.identity().anonymousId;
+    expect(aid, isNotNull);
+    expect(h.storage.data['mk_aid'], aid);
+    expect(h.storage.data.containsKey('mk_optout'), isFalse);
+    expect(h.requests.map((r) => r.url.path), contains('/v1/config'));
+    client.track('back');
+    await client.flush();
+    expect(h.events.last['anonymousId'], aid);
+  });
+
+  test('app version and build are read from the package info; options override them', () async {
+    PackageInfo.setMockInitialValues(
+      appName: 'Example',
+      packageName: 'com.example.app',
+      version: '3.1.0',
+      buildNumber: '310',
+      buildSignature: '',
+    );
+    final client = await Harness(appInfo: false).start();
+    expect(client.context['app'], {'version': '3.1.0', 'build': '310'});
+    expect(client.appVersion, '3.1.0');
+    client.dispose();
+
+    final overridden = await Harness().start();
+    expect(overridden.context['app'], {'version': '2.4.1', 'build': '41'});
   });
 
   test('cookieless: no ids, nothing persisted', () async {

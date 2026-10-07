@@ -4,7 +4,8 @@ import 'package:metrickle/metrickle.dart';
 Future<void> main() async {
   await Metrickle.init(
     writeKey: 'mk_live_your_write_key',
-    options: const MetrickleOptions(appVersion: '1.0.0', appBuild: '1', debug: true),
+    // The app version and build are read from the package info.
+    options: const MetrickleOptions(debug: true),
   );
   runApp(const ExampleApp());
 }
@@ -37,17 +38,25 @@ class HomePage extends StatelessWidget {
               onPressed: () => Navigator.pushNamed(context, 'Checkout'),
               child: const Text('Go to checkout'),
             ),
-            const SizedBox(height: 12),
-            OutlinedButton(
-              onPressed: () async {
-                final messenger = ScaffoldMessenger.of(context);
-                final result = await Metrickle.instance.feedback.submit(
-                  category: FeedbackCategory.idea,
-                  message: 'Sent from the example app',
-                );
-                messenger.showSnackBar(SnackBar(content: Text(result.ok ? 'Thanks!' : 'Could not send')));
-              },
-              child: const Text('Send feedback'),
+            // Hidden while feedback is switched off for Flutter in the dashboard.
+            ValueListenableBuilder(
+              valueListenable: Metrickle.instance.configListenable,
+              builder: (context, _, _) => !Metrickle.instance.feedback.isEnabled
+                  ? const SizedBox.shrink()
+                  : Padding(
+                      padding: const EdgeInsets.only(top: 12),
+                      child: OutlinedButton(
+                        onPressed: () async {
+                          final messenger = ScaffoldMessenger.of(context);
+                          final result = await Metrickle.instance.feedback.submit(
+                            category: FeedbackCategory.idea,
+                            message: 'Sent from the example app',
+                          );
+                          messenger.showSnackBar(SnackBar(content: Text(result.ok ? 'Thanks!' : 'Could not send')));
+                        },
+                        child: const Text('Send feedback'),
+                      ),
+                    ),
             ),
           ],
         ),

@@ -116,15 +116,101 @@ class Targeting {
   final Frequency frequency;
 }
 
+/// Which answers qualify for a follow-up (`FollowUpWhen`): a score band on a scale question, or any
+/// of [choices] on a choice question.
+class FollowUpWhen {
+  const FollowUpWhen({required this.questionId, this.min, this.max, this.choices});
+
+  factory FollowUpWhen.fromJson(Map<String, dynamic> j) => FollowUpWhen(
+        questionId: j['questionId'] as String,
+        min: j['min'] as num?,
+        max: j['max'] as num?,
+        choices: _strings(j['choices']),
+      );
+
+  final String questionId;
+
+  /// Scores: an inclusive band, e.g. NPS detractors are 0–6.
+  final num? min;
+  final num? max;
+
+  /// Choice questions: any of these answers.
+  final List<String>? choices;
+}
+
+/// A campaign's follow-up (`FollowUpConfig`): after the last answer, invite the respondent into a
+/// study, a booked video call (`moderated`) or a self-guided test (`unmoderated`). Only sent while
+/// the study is recruiting.
+class FollowUpConfig {
+  const FollowUpConfig({
+    required this.studyId,
+    required this.kind,
+    required this.prompt,
+    this.when,
+    this.incentive,
+    this.durationMin,
+  });
+
+  factory FollowUpConfig.fromJson(Map<String, dynamic> j) {
+    final kind = j['kind'] as String;
+    if (kind != 'moderated' && kind != 'unmoderated') throw FormatException('unknown follow-up kind', kind);
+    final when = j['when'];
+    return FollowUpConfig(
+      studyId: j['studyId'] as String,
+      kind: kind,
+      prompt: j['prompt'] as String,
+      when: when == null ? null : FollowUpWhen.fromJson(when as Map<String, dynamic>),
+      incentive: j['incentive'] as String?,
+      durationMin: (j['durationMin'] as num?)?.toInt(),
+    );
+  }
+
+  /// Parses a follow-up, or returns null when it is missing or malformed (the campaign still shows,
+  /// without the invite).
+  static FollowUpConfig? tryParse(Object? json) {
+    if (json is! Map<String, dynamic>) return null;
+    try {
+      return FollowUpConfig.fromJson(json);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  final String studyId;
+
+  /// `moderated` (a booked video call) or `unmoderated` (a self-guided test on the web).
+  final String kind;
+
+  /// The invite's heading, e.g. "Would you be up for a short follow-up to tell us more?".
+  final String prompt;
+
+  /// Which answers qualify; null means every response does.
+  final FollowUpWhen? when;
+
+  /// What participants get as a thank-you, e.g. "a £20 gift card".
+  final String? incentive;
+
+  /// Moderated: session length in minutes.
+  final int? durationMin;
+}
+
 /// What the SDK receives for a campaign: only what's needed to decide and render.
 class CampaignConfig {
-  const CampaignConfig({required this.id, required this.questions, required this.targeting, this.thankYou, this.version = 1});
+  const CampaignConfig({
+    required this.id,
+    required this.questions,
+    required this.targeting,
+    this.thankYou,
+    this.followUp,
+    this.version = 1,
+  });
 
   factory CampaignConfig.fromJson(Map<String, dynamic> j) => CampaignConfig(
         id: j['id'] as String,
         questions: [for (final q in j['questions'] as List) Question.fromJson(q as Map<String, dynamic>)],
         targeting: Targeting.fromJson(j['targeting'] as Map<String, dynamic>),
         thankYou: j['thankYou'] as String?,
+        followUp: FollowUpConfig.tryParse(j['followUp']),
         version: (j['version'] as num?)?.toInt() ?? 1,
       );
 
@@ -132,6 +218,9 @@ class CampaignConfig {
   final List<Question> questions;
   final Targeting targeting;
   final String? thankYou;
+
+  /// The invite into a study offered after the last answer, if any.
+  final FollowUpConfig? followUp;
 
   /// Bumps when the campaign is edited.
   final int version;

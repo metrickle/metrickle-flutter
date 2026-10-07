@@ -1,6 +1,8 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
 import 'package:metrickle/metrickle.dart';
 
 import 'helpers.dart';
@@ -96,6 +98,67 @@ void main() {
     expect(cfg.accent, '#1f6fcf');
   });
 
+  test('config: follow-ups parse; a malformed one is dropped, not the campaign', () {
+    Map<String, Object?> cmp(Object? followUp) => {
+          'id': 'c',
+          'questions': [
+            {'id': 'nps', 'type': 'nps', 'prompt': 'Recommend us?'},
+          ],
+          'targeting': {
+            'trigger': {'kind': 'load'},
+          },
+          'followUp': followUp,
+        };
+    final cfg = SdkConfig.tryParse({
+      'v': 1,
+      'campaigns': [
+        cmp({
+          'studyId': 'std_1',
+          'kind': 'moderated',
+          'prompt': 'Talk to us?',
+          'when': {'questionId': 'nps', 'min': 0, 'max': 6},
+          'incentive': 'a £20 gift card',
+          'durationMin': 30,
+        }),
+        cmp({'studyId': 'std_2', 'kind': 'unmoderated', 'prompt': 'Try it?', 'when': {'questionId': 'why', 'choices': ['Price']}}),
+        cmp({'studyId': 'std_3', 'kind': 'focus_group', 'prompt': 'x'}),
+        cmp({'kind': 'moderated', 'prompt': 'no study'}),
+        cmp('nope'),
+        cmp(null),
+      ],
+    })!;
+    expect(cfg.campaigns, hasLength(6));
+    final a = cfg.campaigns[0].followUp!, b = cfg.campaigns[1].followUp!;
+    expect((a.studyId, a.kind, a.prompt, a.incentive, a.durationMin), ('std_1', 'moderated', 'Talk to us?', 'a £20 gift card', 30));
+    expect((a.when!.questionId, a.when!.min, a.when!.max, a.when!.choices), ('nps', 0, 6, null));
+    expect((b.kind, b.durationMin, b.incentive), ('unmoderated', null, null));
+    expect(b.when!.choices, ['Price']);
+    expect(cfg.campaigns.skip(2).map((c) => c.followUp), everyElement(isNull));
+  });
+
+  test('follow-up matching: score band, choices, no condition, unanswered question', () {
+    // Vectors from packages/sdk/src/surveys.test.ts.
+    const nps = FollowUpWhen(questionId: 'nps', min: 0, max: 6);
+    FollowUpAnswer score(num? n) => (score: n, values: null);
+    FollowUpAnswer values(List<String> v) => (score: null, values: v);
+    final cases = <(FollowUpWhen?, Map<String, FollowUpAnswer>, bool)>[
+      (null, {}, true),
+      (nps, {'nps': score(3)}, true),
+      (nps, {'nps': score(0)}, true),
+      (nps, {'nps': score(6)}, true),
+      (nps, {'nps': score(7)}, false),
+      (const FollowUpWhen(questionId: 'nps', min: 9), {'nps': score(10)}, true),
+      (nps, {}, false),
+      (nps, {'nps': score(null)}, false),
+      (const FollowUpWhen(questionId: 'why', choices: ['Price', 'Speed']), {'why': values(['Speed', 'Other'])}, true),
+      (const FollowUpWhen(questionId: 'why', choices: ['Price']), {'why': values(['Speed'])}, false),
+      (const FollowUpWhen(questionId: 'why', choices: ['Price']), {'why': score(3)}, false),
+    ];
+    for (final (i, (cond, answers, expected)) in cases.indexed) {
+      expect(followUpMatches(cond, answers), expected, reason: 'case $i');
+    }
+  });
+
   test('contrastRatio and textOn match the JS helpers', () {
     expect(contrastRatio('#1f6fcf', '#ffffff'), closeTo(4.960978540464101, 1e-12));
     expect(contrastRatio('#777777', '#000000'), closeTo(4.68949989000882, 1e-12));
@@ -184,6 +247,143 @@ void main() {
       final d = h.events.firstWhere((e) => e['name'] == r'$survey_dismissed');
       expect(d['properties'], containsPair('at', 0));
       expect(d['properties'], containsPair('answered', 0));
+    });
+
+    Map<String, Object?> followUpConfig(Map<String, Object?>? followUp) => {
+          'v': 1,
+          'campaigns': [
+            {
+              'id': 'cmp_1',
+              'version': 1,
+              'questions': [
+                {'id': 'nps', 'type': 'nps', 'prompt': 'How likely are you to recommend us?'},
+                {'id': 'why', 'type': 'choice', 'prompt': 'Why?', 'choices': ['Price', 'Speed'], 'required': false},
+              ],
+              'targeting': {
+                'trigger': {'kind': 'load'},
+              },
+              'followUp': ?followUp,
+            },
+          ],
+        };
+
+    Future<(Harness, Metrickle, ActiveSurvey)> followUpSurvey(Map<String, Object?>? followUp, {String? host}) async {
+      final h = Harness(config: followUpConfig(followUp), host: host ?? 'https://in.example.com/');
+      final client = await h.start();
+      final shown = <ActiveSurvey>[];
+      client.surveys.onShow(shown.add);
+      await client.refreshConfig();
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+      return (h, client, shown.single);
+    }
+
+    List<http.Request> invites(Harness h) => h.requests.where((r) => r.url.path == '/v1/studies/invite').toList();
+
+    test('follow-up: a qualifying response gets a personal link and records \$survey_follow_up once each', () async {
+      final (h, client, s) = await followUpSurvey({
+        'studyId': 'std_1',
+        'kind': 'moderated',
+        'prompt': 'Talk to us?',
+        'durationMin': 30,
+        'when': {'questionId': 'nps', 'max': 6},
+      });
+      h.inviteReply = http.Response(jsonEncode({'url': 'https://app.example.com/s/abc'}), 201);
+      client.identify('user_42');
+      s.shown();
+      s.answer(s.campaign.questions[0], const SurveyAnswer(score: 4));
+      s.complete();
+      expect(s.followUp?.studyId, 'std_1');
+      expect(s.qualifies(), isTrue);
+      expect(await s.invite(), 'https://app.example.com/s/abc');
+      // Asked once per response, however often the renderer calls it.
+      expect(await s.invite(), 'https://app.example.com/s/abc');
+      final req = invites(h).single;
+      expect(req.method, 'POST');
+      expect(req.url.toString(), 'https://in.example.com/v1/studies/invite');
+      expect(req.headers['x-metrickle-key'], 'wk_test');
+      expect(req.headers['content-type'], startsWith('application/json'));
+      expect(req.headers['user-agent'], kIsWeb ? isNull : client.userAgent);
+
+      s.followUpOffered();
+      s.followUpOffered();
+      s.followUpAccepted();
+      s.followUpAccepted();
+      await client.flush();
+      final response = h.events.firstWhere((e) => e['name'] == r'$survey_answered')['properties']['response'];
+      expect(jsonDecode(req.body), {
+        'writeKey': 'wk_test',
+        'studyId': 'std_1',
+        'campaignId': 'cmp_1',
+        'response': response,
+        'anonymousId': client.identity().anonymousId,
+        'userId': 'user_42',
+      });
+      final fu = h.events.where((e) => e['name'] == r'$survey_follow_up').map((e) => e['properties']).toList();
+      expect(fu, [
+        {'campaign': 'cmp_1', 'version': 1, 'response': response, 'study': 'std_1', 'accepted': false},
+        {'campaign': 'cmp_1', 'version': 1, 'response': response, 'study': 'std_1', 'accepted': true},
+      ]);
+    });
+
+    test('follow-up: choice condition and no condition', () async {
+      final (_, _, a) = await followUpSurvey({
+        'studyId': 'std_1',
+        'kind': 'unmoderated',
+        'prompt': 'Try it?',
+        'when': {'questionId': 'why', 'choices': ['Price']},
+      });
+      a.answer(a.campaign.questions[0], const SurveyAnswer(score: 2));
+      expect(a.qualifies(), isFalse);
+      a.answer(a.campaign.questions[1], const SurveyAnswer(values: ['Speed', 'Price']));
+      expect(a.qualifies(), isTrue);
+      Metrickle.instance.dispose();
+
+      final (_, _, b) = await followUpSurvey({'studyId': 'std_1', 'kind': 'unmoderated', 'prompt': 'Try it?'});
+      expect(b.qualifies(), isTrue);
+    });
+
+    test('follow-up: no invite for a non-matching answer, a full study, an unsafe link, an error or opt-out', () async {
+      const fu = {
+        'studyId': 'std_1',
+        'kind': 'unmoderated',
+        'prompt': 'Try it?',
+        'when': {'questionId': 'nps', 'max': 6},
+      };
+      Future<String?> attempt(http.Response reply, {int score = 2, String? host, bool optOut = false}) async {
+        Metrickle.maybeInstance?.dispose();
+        final (h, client, s) = await followUpSurvey(fu, host: host);
+        h.inviteReply = reply;
+        s.answer(s.campaign.questions[0], SurveyAnswer(score: score));
+        if (optOut) client.optOut();
+        final url = await s.invite();
+        if (score > 6 || optOut) expect(invites(h), isEmpty);
+        return url;
+      }
+
+      final ok = jsonEncode({'url': 'https://app.example.com/s/abc'});
+      expect(await attempt(http.Response(ok, 201), score: 9), isNull);
+      expect(await attempt(http.Response(ok, 201), optOut: true), isNull);
+      expect(await attempt(http.Response('{"error":"study_full"}', 409)), isNull);
+      expect(await attempt(http.Response(ok, 200)), isNull, reason: 'only a 201 carries a link');
+      expect(await attempt(http.Response('not json', 201)), isNull);
+      expect(await attempt(http.Response(jsonEncode({'url': 'javascript:alert(1)'}), 201)), isNull);
+      expect(await attempt(http.Response(jsonEncode({'url': 'http://app.example.com/s/abc'}), 201)), isNull,
+          reason: 'http only when the host itself is http');
+      expect(await attempt(http.Response(jsonEncode({'url': 'http://localhost:8787/s/abc'}), 201), host: 'http://localhost:8787'),
+          'http://localhost:8787/s/abc');
+
+      // No follow-up configured: nothing to offer, nothing recorded.
+      Metrickle.instance.dispose();
+      final (h, client, d) = await followUpSurvey(null);
+      d.answer(d.campaign.questions[0], const SurveyAnswer(score: 2));
+      expect(d.followUp, isNull);
+      expect(d.qualifies(), isFalse);
+      expect(await d.invite(), isNull);
+      d.followUpOffered();
+      d.followUpAccepted();
+      await client.flush();
+      expect(invites(h), isEmpty);
+      expect(h.events.where((e) => e['name'] == r'$survey_follow_up'), isEmpty);
     });
 
     test('cookieless clients (no storage) never show surveys', () async {

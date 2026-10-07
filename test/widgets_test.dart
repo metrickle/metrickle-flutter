@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
@@ -9,10 +10,26 @@ import 'package:metrickle/metrickle.dart';
 import 'helpers.dart';
 
 class FakeSurvey implements ActiveSurvey {
-  FakeSurvey(this.campaign);
+  FakeSurvey(this.campaign, {this.link, this.qualifying = true});
   @override
   final CampaignConfig campaign;
+  @override
+  FollowUpConfig? get followUp => campaign.followUp;
+  final Future<String?>? link;
+  final bool qualifying;
   final log = <String>[];
+  @override
+  bool qualifies() => followUp != null && qualifying;
+  @override
+  Future<String?> invite() {
+    log.add('invite');
+    return link ?? Future.value(null);
+  }
+
+  @override
+  void followUpOffered() => log.add('offered');
+  @override
+  void followUpAccepted() => log.add('accepted');
   final answers = <(String, SurveyAnswer)>[];
   @override
   void shown() => log.add('shown');
@@ -24,10 +41,28 @@ class FakeSurvey implements ActiveSurvey {
   void dismiss(int atIndex) => log.add('dismiss $atIndex');
 }
 
-Widget sheetApp(ActiveSurvey s, {ThemeData? theme, Color? accent}) => MaterialApp(
+Widget sheetApp(ActiveSurvey s, {ThemeData? theme, Color? accent, Future<bool> Function(Uri)? openUrl}) => MaterialApp(
       theme: theme,
-      home: Scaffold(body: Align(alignment: Alignment.bottomCenter, child: MetrickleSurveySheet(survey: s, accent: accent))),
+      home: Scaffold(
+        body: Align(
+          alignment: Alignment.bottomCenter,
+          child: MetrickleSurveySheet(survey: s, accent: accent, openUrl: openUrl),
+        ),
+      ),
     );
+
+CampaignConfig oneQuestion(FollowUpConfig followUp) => campaign(
+      followUp: followUp,
+      questions: const [Question(id: 'nps', type: 'nps', prompt: 'How likely are you to recommend us?')],
+    );
+
+const moderated = FollowUpConfig(
+  studyId: 'std_1',
+  kind: 'moderated',
+  prompt: 'Would you talk to us for half an hour?',
+  durationMin: 30,
+  incentive: 'a £20 gift card',
+);
 
 void main() {
   group('survey sheet', () {
@@ -84,6 +119,97 @@ void main() {
       expect(s.answers.last.$2.text, 'Fast checkout');
       expect(s.log, ['shown', 'complete']);
       await tester.pump(const Duration(seconds: 7)); // auto-close timer
+    });
+
+    testWidgets('follow-up: "One moment…" while asking, then the invite; it never closes on its own', (tester) async {
+      final handle = tester.ensureSemantics();
+      final link = Completer<String?>();
+      final opened = <Uri>[];
+      final s = FakeSurvey(oneQuestion(moderated), link: link.future);
+      await tester.pumpWidget(sheetApp(s, openUrl: (u) async {
+        opened.add(u);
+        return true;
+      }));
+      await tester.pump();
+      await tester.tap(find.text('3'));
+      await tester.tap(find.text('Submit'));
+      await tester.pump();
+      expect(find.text('One moment…'), findsOneWidget);
+      expect(find.text('How likely are you to recommend us?'), findsOneWidget);
+      expect(s.log, ['shown', 'complete', 'invite']);
+
+      link.complete('https://app.example.com/s/abc');
+      await tester.pump();
+      await tester.pump();
+      expect(find.text('Would you talk to us for half an hour?'), findsOneWidget);
+      expect(tester.getSemantics(find.text('Would you talk to us for half an hour?')), isSemantics(isHeader: true));
+      expect(FocusManager.instance.primaryFocus?.debugLabel, 'metrickle invite heading');
+      expect(find.text('A 30-minute video call at a time that suits you.'), findsOneWidget);
+      expect(find.text('As a thank-you: a £20 gift card'), findsOneWidget);
+      expect(find.text('No thanks'), findsOneWidget);
+      expect(find.bySemanticsLabel('Choose a time, opens in your browser'), findsOneWidget);
+      expect(s.log, ['shown', 'complete', 'invite', 'offered']);
+      await expectLater(tester, meetsGuideline(androidTapTargetGuideline));
+      await expectLater(tester, meetsGuideline(iOSTapTargetGuideline));
+      await expectLater(tester, meetsGuideline(labeledTapTargetGuideline));
+      if (!kIsWeb) await expectLater(tester, meetsGuideline(textContrastGuideline));
+
+      // No auto-close while the invite is up.
+      await tester.pump(const Duration(seconds: 30));
+      expect(find.text('Would you talk to us for half an hour?'), findsOneWidget);
+
+      await tester.tap(find.text('Choose a time'));
+      await tester.pump();
+      expect(opened, [Uri.parse('https://app.example.com/s/abc')]);
+      expect(s.log.last, 'accepted');
+      expect(find.text('Thanks for your feedback'), findsOneWidget);
+      await tester.pump(const Duration(seconds: 7));
+      handle.dispose();
+    });
+
+    testWidgets('follow-up: unmoderated wording; "No thanks" goes to the thank-you', (tester) async {
+      const fu = FollowUpConfig(studyId: 'std_2', kind: 'unmoderated', prompt: 'Try a new design?');
+      final s = FakeSurvey(oneQuestion(fu), link: Future.value('https://app.example.com/s/xyz'));
+      await tester.pumpWidget(sheetApp(s, openUrl: (_) async => fail('should not open')));
+      await tester.pump();
+      await tester.tap(find.text('8'));
+      await tester.tap(find.text('Submit'));
+      await tester.pump();
+      await tester.pump();
+      expect(find.text('A short self-guided test of the site. Takes about 10–15 minutes.'), findsOneWidget);
+      expect(find.textContaining('As a thank-you'), findsNothing);
+      expect(find.bySemanticsLabel('Take part, opens in your browser'), findsOneWidget);
+      await tester.tap(find.text('No thanks'));
+      await tester.pump();
+      expect(find.text('Thanks for your feedback'), findsOneWidget);
+      expect(s.log, isNot(contains('accepted')));
+      await tester.pump(const Duration(seconds: 7));
+    });
+
+    testWidgets('follow-up: no link within 5s, or not qualifying, shows the plain thank-you', (tester) async {
+      final slow = FakeSurvey(oneQuestion(moderated), link: Completer<String?>().future);
+      await tester.pumpWidget(sheetApp(slow));
+      await tester.pump();
+      await tester.tap(find.text('3'));
+      await tester.tap(find.text('Submit'));
+      await tester.pump();
+      expect(find.text('One moment…'), findsOneWidget);
+      await tester.pump(const Duration(seconds: 5));
+      await tester.pump();
+      expect(find.text('Thanks for your feedback'), findsOneWidget);
+      expect(slow.log, isNot(contains('offered')));
+      await tester.pump(const Duration(seconds: 7));
+
+      await tester.pumpWidget(const SizedBox());
+      final no = FakeSurvey(oneQuestion(moderated), qualifying: false);
+      await tester.pumpWidget(sheetApp(no));
+      await tester.pump();
+      await tester.tap(find.text('9'));
+      await tester.tap(find.text('Submit'));
+      await tester.pump();
+      expect(find.text('Thanks for your feedback'), findsOneWidget);
+      expect(no.log, ['shown', 'complete']);
+      await tester.pump(const Duration(seconds: 7));
     });
 
     testWidgets('dark theme, large text and choice questions stay accessible', (tester) async {
@@ -283,4 +409,3 @@ void main() {
   });
 }
 
-void unawaited(Future<void> f) {}

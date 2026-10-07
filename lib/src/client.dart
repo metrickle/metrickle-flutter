@@ -6,6 +6,8 @@ import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 import 'package:http/http.dart' as http;
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'config.dart';
 import 'event.dart';
@@ -16,7 +18,7 @@ import 'surveys.dart';
 import 'uturn.dart';
 
 /// SDK version, sent in `context.library` and the User-Agent.
-const sdkVersion = '0.1.0';
+const sdkVersion = '0.2.0';
 
 /// Accessibility flags in `A11Y_FLAGS` order (`packages/schema/src/constants.ts`).
 const a11yFlags = [
@@ -61,6 +63,7 @@ class MetrickleOptions {
     this.httpClient,
     this.storage,
     this.clock,
+    this.openUrl,
   });
 
   /// Ingest origin. A trailing slash is ignored.
@@ -83,7 +86,8 @@ class MetrickleOptions {
   /// Called before each event is queued; return null to drop it (e.g. PII scrubbing).
   final MetrickleEvent? Function(MetrickleEvent event)? beforeSend;
 
-  /// Your app's version and build (e.g. from `package_info_plus`), for `context.app` and survey targeting.
+  /// Your app's version and build, for `context.app`, release detection and survey targeting. Read
+  /// from the app's package info (`package_info_plus`) when not set; set them to override it.
   final String? appVersion;
   final String? appBuild;
 
@@ -103,13 +107,17 @@ class MetrickleOptions {
 
   /// Epoch ms clock, for tests.
   final int Function()? clock;
+
+  /// Opens a study invite link from the built-in survey sheet. Defaults to the system browser
+  /// (`url_launcher`, external application). Inject it in tests.
+  final Future<bool> Function(Uri url)? openUrl;
 }
 
 /// Metrickle client: events, screens, identity, sessions and a persisted offline queue. Port of
 /// `core.ts`; see `docs/NATIVE_SDKS.md` for the shared contract.
 ///
 /// ```dart
-/// await Metrickle.init(writeKey: 'mk_live_…', options: const MetrickleOptions(appVersion: '1.4.0'));
+/// await Metrickle.init(writeKey: 'mk_live_…');
 /// Metrickle.instance.track('checkout_started');
 /// ```
 class Metrickle {
@@ -171,9 +179,9 @@ class Metrickle {
   Set<String> _platformA11y = {};
   Set<String> _scopeA11y = {};
   bool _hasScope = false;
-  SdkConfig? _config;
+  final _config = ValueNotifier<SdkConfig?>(null);
 
-  late final SurveyEngine _engine = SurveyEngine(this, platform: 'flutter', appVersion: options.appVersion, a11y: () => a11y);
+  late final SurveyEngine _engine = SurveyEngine(this, platform: 'flutter', appVersion: () => appVersion, a11y: () => a11y);
 
   /// Surveys: headless rendering via [MetrickleSurveys.onShow], or the built-in sheet.
   late final MetrickleSurveys surveys = MetrickleSurveys._(this);
@@ -193,7 +201,14 @@ class Metrickle {
   String? get currentScreen => _screen;
 
   /// The last `/v1/config` response.
-  SdkConfig? get config => _config;
+  SdkConfig? get config => _config.value;
+
+  /// Notifies when a new config arrives, e.g. to show or hide a feedback button with
+  /// `feedback.isEnabled` (use a `ValueListenableBuilder`).
+  ValueListenable<SdkConfig?> get configListenable => _config;
+
+  /// The app version sent in `context.app` (from [MetrickleOptions.appVersion] or the package info).
+  String? get appVersion => (_context['app'] as Map<String, Object?>?)?['version'] as String?;
 
   /// Current accessibility flags (`context.a11y`).
   List<String> get a11y => (_context['a11y'] as List<String>?) ?? const [];
@@ -221,7 +236,7 @@ class Metrickle {
     _context.addAll(_readContext());
     _platformA11y = _readPlatformA11y();
     _applyA11y();
-    await _restore();
+    await Future.wait([_readAppInfo(), _restore()]);
     await _engine.ready;
     _timer = Timer.periodic(options.flushInterval, (_) => flush());
     _lifecycle = AppLifecycleListener(onShow: _onForeground, onHide: _onBackground);
@@ -237,13 +252,16 @@ class Metrickle {
       for (final k in (await s.get(_kConsent) ?? '').split(',')) {
         if (k == 'replay') _consents.add(k);
       }
-      _anonymousId = await s.get(_kAnon);
-      if (_anonymousId == null) {
-        _anonymousId = uuid();
-        await s.set(_kAnon, _anonymousId!);
+      // Opted out: never create an anonymous id, and don't use one left from before.
+      if (!_optedOut) {
+        _anonymousId = await s.get(_kAnon);
+        if (_anonymousId == null) {
+          _anonymousId = uuid();
+          await s.set(_kAnon, _anonymousId!);
+        }
       }
       _userId = await s.get(_kUser);
-      final raw = await s.get(_kSession);
+      final raw = _optedOut ? null : await s.get(_kSession);
       if (raw != null) {
         final j = jsonDecode(raw) as Map<String, dynamic>;
         _session = (id: j['id'] as String, last: (j['last'] as num).toInt());
@@ -262,6 +280,21 @@ class Metrickle {
     } catch (e) {
       _log('queue restore failed', e);
     }
+  }
+
+  /// Fills `context.app` from the package info for whatever the options don't set.
+  Future<void> _readAppInfo() async {
+    var version = options.appVersion, build = options.appBuild;
+    if (version == null || build == null) {
+      try {
+        final info = await PackageInfo.fromPlatform().timeout(const Duration(seconds: 3));
+        version ??= info.version.isEmpty ? null : info.version;
+        build ??= info.buildNumber.isEmpty ? null : info.buildNumber;
+      } catch (e) {
+        _log('package info unavailable', e);
+      }
+    }
+    if (version != null || build != null) _context['app'] = {'version': ?version, 'build': ?build};
   }
 
   Map<String, Object?> _readContext() {
@@ -288,8 +321,6 @@ class Metrickle {
     };
     return {
       'platform': 'flutter',
-      if (options.appVersion != null || options.appBuild != null)
-        'app': {'version': ?options.appVersion, 'build': ?options.appBuild},
       'device': {'type': type, 'model': ?options.deviceModel, 'os': os, 'osVersion': ?(options.osVersion ?? platformOsVersion())},
       if (size != null) 'screen': {'width': size.width.round(), 'height': size.height.round()},
       'locale': ui.PlatformDispatcher.instance.locale.toLanguageTag(),
@@ -297,7 +328,7 @@ class Metrickle {
     };
   }
 
-  /// `metrickle-flutter/0.1.0 (iOS 17.2; iPhone15,2)`.
+  /// `metrickle-flutter/0.2.0 (iOS 17.2; iPhone15,2)`.
   String get userAgent {
     final d = _context['device'] as Map<String, Object?>;
     final os = [d['os'], d['osVersion']].whereType<String>().join(' ');
@@ -456,30 +487,49 @@ class Metrickle {
     capture('identify', r'$identify', traits: traits);
   }
 
-  /// Call on logout: forgets the user and session and starts a new anonymous identity.
+  /// Call on logout: forgets the user and session and starts a new anonymous identity (none while
+  /// opted out).
   void reset() {
     _userId = null;
     _session = null;
     final s = storage;
-    _anonymousId = s != null ? uuid() : null;
+    _anonymousId = s != null && !_optedOut ? uuid() : null;
     if (s != null) {
       s.remove(_kUser);
       s.remove(_kSession);
-      s.set(_kAnon, _anonymousId!);
+      if (_anonymousId != null) s.set(_kAnon, _anonymousId!);
     }
   }
 
-  /// Stops all collection and network calls, clears the queue, and remembers the choice.
+  /// Stops all collection and network calls, clears the queue, removes the anonymous and session
+  /// ids from the device, and remembers the choice. Your own user id (from [identify]) and consent
+  /// are kept.
   void optOut() {
     _optedOut = true;
     _queue = [];
-    storage?.set(_kOptOut, '1');
-    storage?.remove(_kQueue);
+    _anonymousId = null;
+    _session = null;
+    final s = storage;
+    if (s != null) {
+      s.set(_kOptOut, '1');
+      s.remove(_kQueue);
+      s.remove(_kAnon);
+      s.remove(_kSession);
+    }
   }
 
+  /// Reverses [optOut]: starts a new anonymous identity and fetches surveys and settings again.
   void optIn() {
     _optedOut = false;
-    storage?.remove(_kOptOut);
+    final s = storage;
+    if (s != null) {
+      s.remove(_kOptOut);
+      if (_anonymousId == null) {
+        _anonymousId = uuid();
+        s.set(_kAnon, _anonymousId!);
+      }
+    }
+    unawaited(refreshConfig());
   }
 
   void _persistQueue() {
@@ -564,7 +614,7 @@ class Metrickle {
       if (res.statusCode < 200 || res.statusCode >= 300) return;
       final cfg = SdkConfig.tryParse(jsonDecode(res.body));
       if (cfg == null || _disposed) return;
-      _config = cfg;
+      _config.value = cfg;
       _engine.setConfig(cfg);
     } catch (e) {
       _log('config failed', e);
@@ -595,6 +645,17 @@ class Metrickle {
     _lifecycle?.dispose();
     _engine.dispose();
     if (identical(_instance, this)) _instance = null;
+  }
+
+  /// Opens [url] with [MetrickleOptions.openUrl], or in the system browser. False when it couldn't.
+  Future<bool> openUrl(Uri url) async {
+    try {
+      final open = options.openUrl;
+      return open != null ? await open(url) : await launchUrl(url, mode: LaunchMode.externalApplication);
+    } catch (e) {
+      _log('could not open link', e);
+      return false;
+    }
   }
 
   // Wiring for MetrickleScope.

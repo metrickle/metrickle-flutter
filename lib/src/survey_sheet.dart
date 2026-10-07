@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
 import 'package:flutter/services.dart';
 
+import 'client.dart';
 import 'config.dart';
 import 'contrast.dart';
 import 'surveys.dart';
@@ -20,14 +21,21 @@ const _scaleEnds = {
 /// mode and high contrast from the theme, no animation with reduced motion, a visible Close button,
 /// Escape/back to dismiss, and a thank-you message.
 ///
+/// When the campaign has a follow-up and the answers qualify, the sheet asks for the respondent's
+/// personal study link after the last answer ("One moment…" on the submit button, up to 5s) and,
+/// if one comes back, shows the invite before the thank-you. The invite never closes on its own.
+///
 /// [MetrickleScope] shows it in a modal bottom sheet. Closing it before the end reports
 /// `$survey_dismissed`. [accent] is used for the primary colour only when it reaches 4.5:1
 /// against the surface.
 class MetrickleSurveySheet extends StatefulWidget {
-  const MetrickleSurveySheet({super.key, required this.survey, this.accent, this.onClose});
+  const MetrickleSurveySheet({super.key, required this.survey, this.accent, this.onClose, this.openUrl});
 
   final ActiveSurvey survey;
   final Color? accent;
+
+  /// Opens the study invite link. Defaults to [Metrickle.openUrl] (the system browser).
+  final Future<bool> Function(Uri url)? openUrl;
 
   /// Defaults to popping the enclosing route.
   final VoidCallback? onClose;
@@ -48,6 +56,13 @@ class _MetrickleSurveySheetState extends State<MetrickleSurveySheet> {
   bool _closed = false;
   Timer? _autoClose;
 
+  /// Waiting for the invite link after the last answer.
+  bool _waiting = false;
+
+  /// The personal study link while the invite is on screen.
+  String? _inviteUrl;
+  final _inviteHeading = FocusNode(debugLabel: 'metrickle invite heading');
+
   CampaignConfig get _campaign => widget.survey.campaign;
   Question get _q => _campaign.questions[_index];
 
@@ -67,6 +82,7 @@ class _MetrickleSurveySheetState extends State<MetrickleSurveySheet> {
     _autoClose?.cancel();
     if (!_done) widget.survey.dismiss(_index);
     _heading.dispose();
+    _inviteHeading.dispose();
     _text.dispose();
     super.dispose();
   }
@@ -91,6 +107,7 @@ class _MetrickleSurveySheetState extends State<MetrickleSurveySheet> {
       };
 
   void _next({bool skip = false}) {
+    if (_waiting) return;
     final a = skip ? null : _read();
     if (!skip && a == null && _q.required) {
       setState(() => _error = _q.type == 'text'
@@ -101,22 +118,65 @@ class _MetrickleSurveySheetState extends State<MetrickleSurveySheet> {
     if (a != null) widget.survey.answer(_q, a);
     setState(() {
       _error = null;
-      _score = null;
-      _single = null;
-      _values.clear();
-      _text.clear();
       if (_index < _campaign.questions.length - 1) {
         _index++;
+        _score = null;
+        _single = null;
+        _values.clear();
+        _text.clear();
       } else {
         _done = true;
         widget.survey.complete();
       }
     });
-    // The user is mid-interaction, so moving focus to the next heading (or the thanks) is expected.
+    if (!_done) {
+      // The user is mid-interaction, so moving focus to the next heading is expected.
+      WidgetsBinding.instance.addPostFrameCallback((_) => mounted ? _heading.requestFocus() : null);
+      return;
+    }
+    final s = widget.survey;
+    if (s.followUp == null || !s.qualifies()) return _thanks();
+    // Ask for the personal link before saying anything: no invite is shown that can't be kept.
+    // Focus stays on the submit button meanwhile, which reads "One moment…".
+    setState(() => _waiting = true);
+    s.invite().timeout(const Duration(seconds: 5), onTimeout: () => null).catchError((_) => null).then((url) {
+      if (!mounted || _closed) return;
+      if (url == null) return _thanks();
+      setState(() {
+        _waiting = false;
+        _inviteUrl = url;
+      });
+      s.followUpOffered();
+      // The user just submitted, so moving focus to the invite is expected. It stays until they choose.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _inviteHeading.requestFocus();
+        SemanticsService.sendAnnouncement(View.of(context), s.followUp!.prompt, Directionality.of(context));
+      });
+    });
+  }
+
+  void _thanks() {
+    if (!mounted) return;
+    setState(() {
+      _waiting = false;
+      _inviteUrl = null;
+    });
     WidgetsBinding.instance.addPostFrameCallback((_) => mounted ? _heading.requestFocus() : null);
-    if (_done && !(MediaQuery.maybeAccessibleNavigationOf(context) ?? false)) {
+    _autoClose?.cancel();
+    if (!(MediaQuery.maybeAccessibleNavigationOf(context) ?? false)) {
       _autoClose = Timer(const Duration(seconds: 6), _close);
     }
+  }
+
+  Future<void> _accept() async {
+    final url = _inviteUrl;
+    if (url == null) return;
+    widget.survey.followUpAccepted();
+    final uri = Uri.parse(url);
+    final open = widget.openUrl ?? Metrickle.maybeInstance?.openUrl;
+    if (open != null) await open(uri);
+    _thanks();
   }
 
   @override
@@ -168,7 +228,9 @@ class _MetrickleSurveySheetState extends State<MetrickleSurveySheet> {
                       ],
                     ),
                     const SizedBox(height: 8),
-                    if (_done)
+                    if (_inviteUrl != null)
+                      _invite(theme)
+                    else if (_done && !_waiting)
                       Semantics(
                         liveRegion: true,
                         child: Text(_campaign.thankYou ?? 'Thanks for your feedback', style: theme.textTheme.bodyLarge),
@@ -189,10 +251,12 @@ class _MetrickleSurveySheetState extends State<MetrickleSurveySheet> {
                         spacing: 8,
                         runSpacing: 8,
                         children: [
-                          if (!_q.required) TextButton(onPressed: () => _next(skip: true), child: const Text('Skip')),
+                          if (!_q.required && !_waiting)
+                            TextButton(onPressed: () => _next(skip: true), child: const Text('Skip')),
+                          // Stays enabled while waiting, so focus isn't dropped; _next ignores it.
                           FilledButton(
                             onPressed: _next,
-                            child: Text(_index == total - 1 ? 'Submit' : 'Next'),
+                            child: Text(_waiting ? 'One moment…' : (_index == total - 1 ? 'Submit' : 'Next')),
                           ),
                         ],
                       ),
@@ -204,6 +268,51 @@ class _MetrickleSurveySheetState extends State<MetrickleSurveySheet> {
           ),
         ),
       ),
+    );
+  }
+
+  Widget _invite(ThemeData theme) {
+    final f = widget.survey.followUp!;
+    final what = f.kind == 'moderated'
+        ? 'A ${f.durationMin != null ? '${f.durationMin}-minute ' : ''}video call at a time that suits you.'
+        : 'A short self-guided test of the site. Takes about 10–15 minutes.';
+    final action = f.kind == 'moderated' ? 'Choose a time' : 'Take part';
+    final incentive = f.incentive;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Focus(
+          focusNode: _inviteHeading,
+          child: Semantics(
+            header: true,
+            child: Text(f.prompt, style: theme.textTheme.titleSmall),
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(what, style: theme.textTheme.bodyMedium),
+        if (incentive != null && incentive.isNotEmpty) ...[
+          const SizedBox(height: 4),
+          Text('As a thank-you: $incentive', style: theme.textTheme.bodyMedium),
+        ],
+        const SizedBox(height: 16),
+        Wrap(
+          alignment: WrapAlignment.end,
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            TextButton(onPressed: _thanks, child: const Text('No thanks')),
+            FilledButton.icon(
+              onPressed: _accept,
+              icon: const Icon(Icons.open_in_new, size: 18),
+              label: Semantics(
+                label: '$action, opens in your browser',
+                excludeSemantics: true,
+                child: Text(action),
+              ),
+            ),
+          ],
+        ),
+      ],
     );
   }
 
